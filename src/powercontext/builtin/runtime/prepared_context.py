@@ -34,6 +34,11 @@ from powercontext.builtin.runtime.prepared_code import (
     PreparedCodeCandidate,
     assemble_code,
 )
+from powercontext.builtin.runtime.prepared_evidence import (
+    MemoryEntryAddress,
+    PreparedMemoryFragment,
+    select_memory_evidence,
+)
 from powercontext.builtin.runtime.prepared_text import (
     TRUST_POLICY,
     ContextTextItem,
@@ -106,15 +111,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
-
-
-@dataclass(frozen=True)
-class MemoryEntryAddress:
-    """Identify one exact Memory entry version across Scope boundaries."""
-
-    memory: ArtifactAddress
-    entry_id: str
-    entry_version_id: str
+    fragments: tuple[PreparedMemoryFragment, ...] = ()
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +208,17 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            if sum(len(group.hits) for group in memory_candidates) > self.memory_candidate_limit:
+                raise PreparedContextInvariantError("memory-candidate-limit")
+            content, fragments = select_memory_evidence(request, memory_candidates)
+            return PreparedContextBuild(
+                context=self.empty()
+                if content is None
+                else PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+                origins=tuple(fragment.address for fragment in fragments),
+                fragments=fragments,
+            )
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -277,6 +285,17 @@ class PreparedContextBuilder:
         counters because both go through :meth:`_select_entries`.
         """
 
+        if request.evidence_selection:
+            build = self.build_scopes_result(
+                request=request, current_scope_id=current_scope_id, memory_candidates=memory_candidates
+            )
+            return RecallBudgetView(
+                max_bytes=request.max_bytes,
+                delivered_items=len(build.fragments),
+                truncated_items=0,
+                dropped_items=0,
+                unused_bytes=request.max_bytes - build.context.content_bytes,
+            )
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
