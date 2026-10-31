@@ -59,6 +59,8 @@ from powercontext.builtin.persistence.tables import (
     identity_string,
 )
 from powercontext.builtin.persistence.topic_memory_index import (
+    topic_lifecycle_predicate,
+    topic_lifecycle_sql,
     topic_memory_embedding_profile_fingerprint,
     validate_current_topic_vectors,
 )
@@ -86,12 +88,13 @@ _VECTOR_TYPE_SQL = text(
 # Keep ANN selection join-free: CE 4.3.5.6 can lose neighbors when its
 # distance-ordered vector scan participates directly in a merge join.
 # The LIMIT boundary precedes active-head hydration and Topic collapse.
-_TOPIC_VECTOR_SEARCH = """
+_TOPIC_VECTOR_SEARCH = f"""
 WITH candidates AS (
     SELECT v.scope_id, v.artifact_id, v.revision,
            l2_distance(v.embedding, :query_vector) AS distance
     FROM pc_topic_memory_vector_topics AS v
     WHERE v.scope_id = :scope_id
+      AND {topic_lifecycle_sql("v")}
       AND v.profile_fingerprint = :profile_fingerprint
     ORDER BY l2_distance(v.embedding, :query_vector) APPROXIMATE
     LIMIT :candidate_limit
@@ -101,13 +104,14 @@ FROM candidates AS n
 JOIN pc_topic_memory_active_topics AS a
   ON a.scope_id = n.scope_id AND a.artifact_id = n.artifact_id AND a.revision = n.revision
 ORDER BY distance, artifact_id, revision DESC
-"""
-_CHUNK_VECTOR_SEARCH = """
+"""  # noqa: S608 - Only internal visibility predicates; request values remain bound.
+_CHUNK_VECTOR_SEARCH = f"""
 WITH neighbors AS (
     SELECT v.scope_id, v.artifact_id, v.revision, v.chunk_ordinal,
            l2_distance(v.embedding, :query_vector) AS distance
     FROM pc_topic_memory_vector_chunks AS v
     WHERE v.scope_id = :scope_id
+      AND {topic_lifecycle_sql("v")}
       AND v.profile_fingerprint = :profile_fingerprint
     ORDER BY l2_distance(v.embedding, :query_vector) APPROXIMATE
     LIMIT :neighbor_limit
@@ -131,7 +135,7 @@ FROM ranked
 WHERE topic_rank = 1
 ORDER BY distance, artifact_id, revision DESC, chunk_ordinal
 LIMIT :candidate_limit
-"""
+"""  # noqa: S608 - Only internal visibility predicates; request values remain bound.
 
 
 class OceanBaseTopicMemoryFTSIndex:
@@ -185,6 +189,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                topic_lifecycle_predicate(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE),
                 topic_score,
             )
         )
@@ -193,6 +198,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                topic_lifecycle_predicate(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE),
                 topic_score,
                 topic_coverage,
             )
@@ -207,6 +213,7 @@ class OceanBaseTopicMemoryFTSIndex:
                 )
                 .where(
                     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                    topic_lifecycle_predicate(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE),
                     topic_score,
                     topic_coverage,
                 )
@@ -258,6 +265,7 @@ class OceanBaseTopicMemoryFTSIndex:
             )
             .where(
                 TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id == scope_id,
+                topic_lifecycle_predicate(TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE),
                 chunk_score,
             )
             .subquery()

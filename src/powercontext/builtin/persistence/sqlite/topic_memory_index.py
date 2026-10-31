@@ -30,6 +30,7 @@ from sqlalchemy import (
     UniqueConstraint,
     column,
     delete,
+    func,
     insert,
     select,
     table,
@@ -59,6 +60,8 @@ from powercontext.builtin.persistence.tables import (
     identity_string,
 )
 from powercontext.builtin.persistence.topic_memory_index import (
+    topic_lifecycle_predicate,
+    topic_lifecycle_sql,
     topic_memory_embedding_profile_fingerprint,
     validate_current_topic_vectors,
 )
@@ -153,6 +156,7 @@ _SEARCH_TOPIC_FTS_SQL = """
                bm25(pc_topic_memory_topic_fts) AS score, ({coverage}) AS coverage
         FROM pc_topic_memory_topic_fts
         WHERE pc_topic_memory_topic_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     )
     SELECT artifact_id, revision, title, summary
     FROM scored
@@ -164,12 +168,14 @@ _COUNT_TOPIC_FTS_SQL = """
     SELECT count(*)
     FROM pc_topic_memory_topic_fts
     WHERE pc_topic_memory_topic_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     """
 _COUNT_TOPIC_FTS_ELIGIBLE_SQL = """
     WITH scored AS (
         SELECT ({coverage}) AS coverage
         FROM pc_topic_memory_topic_fts
         WHERE pc_topic_memory_topic_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     )
     SELECT count(*)
     FROM scored
@@ -181,6 +187,7 @@ _SEARCH_CHUNK_FTS_SQL = """
                bm25(pc_topic_memory_chunk_fts) AS score, ({coverage}) AS coverage
         FROM pc_topic_memory_chunk_fts
         WHERE pc_topic_memory_chunk_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     ), ranked AS (
         SELECT scored.*,
                row_number() OVER (
@@ -201,6 +208,7 @@ _COUNT_CHUNK_FTS_SQL = """
                bm25(pc_topic_memory_chunk_fts) AS score, ({coverage}) AS coverage
         FROM pc_topic_memory_chunk_fts
         WHERE pc_topic_memory_chunk_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     ), ranked AS (
         SELECT scored.*,
                row_number() OVER (
@@ -219,6 +227,7 @@ _COUNT_CHUNK_FTS_ELIGIBLE_SQL = """
                bm25(pc_topic_memory_chunk_fts) AS score, ({coverage}) AS coverage
         FROM pc_topic_memory_chunk_fts
         WHERE pc_topic_memory_chunk_fts MATCH :query AND scope_id = :scope_id
+          AND {lifecycle}
     ), ranked AS (
         SELECT scored.*,
                row_number() OVER (
@@ -247,13 +256,14 @@ _PROBE_CHUNK_VECTOR_SQL = (
     "SELECT rowid FROM pc_topic_memory_chunk_vec WHERE scope_id = ? AND embedding MATCH ? AND k = 1"
 )
 _TOPIC_VECTOR_SEARCH_SQL = text(
-    """
+    f"""
     WITH nearest AS (
         SELECT rowid, distance FROM pc_topic_memory_topic_vec
         WHERE scope_id = :scope_id AND embedding MATCH :query_vector AND k = :neighbor_limit
           AND rowid IN (
               SELECT vector_id FROM pc_topic_memory_vector_topics
               WHERE scope_id = :scope_id AND profile_fingerprint = :profile_fingerprint
+                AND {topic_lifecycle_sql("pc_topic_memory_vector_topics")}
           )
     )
     SELECT a.artifact_id, a.revision, a.title, a.summary, nearest.distance
@@ -264,16 +274,17 @@ _TOPIC_VECTOR_SEARCH_SQL = text(
     WHERE v.scope_id = :scope_id
     ORDER BY nearest.distance, a.artifact_id, a.revision DESC
     LIMIT :candidate_limit
-    """
+    """  # noqa: S608 - Only internal visibility predicates; request values remain bound.
 )
 _CHUNK_VECTOR_SEARCH_SQL = text(
-    """
+    f"""
     WITH nearest AS (
         SELECT rowid, distance FROM pc_topic_memory_chunk_vec
         WHERE scope_id = :scope_id AND embedding MATCH :query_vector AND k = :neighbor_limit
           AND rowid IN (
               SELECT vector_id FROM pc_topic_memory_vector_chunks
               WHERE scope_id = :scope_id AND profile_fingerprint = :profile_fingerprint
+                AND {topic_lifecycle_sql("pc_topic_memory_vector_chunks")}
           )
     ), ranked AS (
         SELECT a.artifact_id, a.revision, a.title, a.summary,
@@ -297,7 +308,7 @@ _CHUNK_VECTOR_SEARCH_SQL = text(
     WHERE topic_rank = 1
     ORDER BY distance, artifact_id, revision DESC, chunk_ordinal
     LIMIT :candidate_limit
-    """
+    """  # noqa: S608 - Only internal visibility predicates; request values remain bound.
 )
 
 
@@ -408,21 +419,52 @@ class SQLiteTopicMemoryFTSIndex:
             "required_matches": required_matches,
             **{f"coverage_term_{position}": f" {term} " for position, term in enumerate(query_terms)},
         }
-        topic_retrieved = await connection.scalar(text(_COUNT_TOPIC_FTS_SQL), parameters)
+        topic_retrieved = await connection.scalar(
+            text(_COUNT_TOPIC_FTS_SQL.format(lifecycle=topic_lifecycle_sql("pc_topic_memory_topic_fts"))), parameters
+        )
         topic_eligible = await connection.scalar(
-            text(_COUNT_TOPIC_FTS_ELIGIBLE_SQL.format(coverage=coverage)),
+            text(
+                _COUNT_TOPIC_FTS_ELIGIBLE_SQL.format(
+                    coverage=coverage, lifecycle=topic_lifecycle_sql("pc_topic_memory_topic_fts")
+                )
+            ),
             parameters,
         )
         topic_rows = (
-            await connection.execute(text(_SEARCH_TOPIC_FTS_SQL.format(coverage=coverage)), parameters)
+            await connection.execute(
+                text(
+                    _SEARCH_TOPIC_FTS_SQL.format(
+                        coverage=coverage, lifecycle=topic_lifecycle_sql("pc_topic_memory_topic_fts")
+                    )
+                ),
+                parameters,
+            )
         ).mappings()
-        detail_retrieved = await connection.scalar(text(_COUNT_CHUNK_FTS_SQL.format(coverage=coverage)), parameters)
+        detail_retrieved = await connection.scalar(
+            text(
+                _COUNT_CHUNK_FTS_SQL.format(
+                    coverage=coverage, lifecycle=topic_lifecycle_sql("pc_topic_memory_chunk_fts")
+                )
+            ),
+            parameters,
+        )
         detail_eligible = await connection.scalar(
-            text(_COUNT_CHUNK_FTS_ELIGIBLE_SQL.format(coverage=coverage)),
+            text(
+                _COUNT_CHUNK_FTS_ELIGIBLE_SQL.format(
+                    coverage=coverage, lifecycle=topic_lifecycle_sql("pc_topic_memory_chunk_fts")
+                )
+            ),
             parameters,
         )
         chunk_rows = (
-            await connection.execute(text(_SEARCH_CHUNK_FTS_SQL.format(coverage=coverage)), parameters)
+            await connection.execute(
+                text(
+                    _SEARCH_CHUNK_FTS_SQL.format(
+                        coverage=coverage, lifecycle=topic_lifecycle_sql("pc_topic_memory_chunk_fts")
+                    )
+                ),
+                parameters,
+            )
         ).mappings()
         return TopicMemorySearchChannels(
             topic_fts=tuple(_channel_hit(row, "topic_fts") for row in topic_rows),
@@ -622,24 +664,20 @@ class SQLiteTopicMemoryVectorIndex:
             "profile_fingerprint": self._fingerprint,
             "candidate_limit": request.candidate_limit,
         }
-        topic_rows = (
-            await connection.execute(
-                _TOPIC_VECTOR_SEARCH_SQL,
-                {**parameters, "neighbor_limit": request.candidate_limit},
-            )
-        ).mappings()
-        chunk_rows = (
-            await connection.execute(
-                _CHUNK_VECTOR_SEARCH_SQL,
-                {
-                    **parameters,
-                    "neighbor_limit": min(
-                        request.candidate_limit * TOPIC_MEMORY_CHUNK_MAX_COUNT,
-                        _SQLITE_VEC_MAX_K,
-                    ),
-                },
-            )
-        ).mappings()
+        topic_rows = await _eligible_vector_rows(
+            connection,
+            _TOPIC_VECTOR_SEARCH_SQL,
+            parameters,
+            SQLITE_TOPIC_MEMORY_VECTOR_TOPICS_TABLE,
+            request.candidate_limit,
+        )
+        chunk_rows = await _eligible_vector_rows(
+            connection,
+            _CHUNK_VECTOR_SEARCH_SQL,
+            parameters,
+            SQLITE_TOPIC_MEMORY_VECTOR_CHUNKS_TABLE,
+            request.candidate_limit * TOPIC_MEMORY_CHUNK_MAX_COUNT,
+        )
         return TopicMemorySearchChannels(
             topic_vector=tuple(_channel_hit(row, "topic_vector") for row in topic_rows),
             detail_vector=tuple(_channel_hit(row, "detail_vector") for row in chunk_rows),
@@ -746,6 +784,37 @@ class SQLiteTopicMemoryVectorIndex:
                 SQLITE_TOPIC_MEMORY_VECTOR_TOPICS_TABLE.c.artifact_id == artifact_id,
             )
         )
+
+
+async def _eligible_vector_rows(
+    connection: AsyncConnection,
+    statement: Any,
+    parameters: dict[str, Any],
+    metadata: Table,
+    initial_budget: int,
+) -> tuple[Mapping[Any, Any], ...]:
+    eligible = await connection.scalar(
+        select(func.count(func.distinct(metadata.c.artifact_id))).where(
+            metadata.c.scope_id == parameters["scope_id"],
+            metadata.c.profile_fingerprint == parameters["profile_fingerprint"],
+            topic_lifecycle_predicate(metadata),
+        )
+    )
+    target = min(parameters["candidate_limit"], int(eligible or 0))
+    if not target:
+        return ()
+    population = await connection.scalar(
+        select(func.count()).select_from(metadata).where(metadata.c.scope_id == parameters["scope_id"])
+    )
+    cap = min(int(population or 0), _SQLITE_VEC_MAX_K)
+    budget = min(initial_budget, cap)
+    # sqlite-vec can apply the rowid whitelist after its KNN budget. Expand
+    # that budget until enough eligible topics survive, without scanning vectors.
+    while True:
+        rows = tuple((await connection.execute(statement, {**parameters, "neighbor_limit": budget})).mappings().all())
+        if len(rows) >= target or budget >= cap:
+            return rows
+        budget = min(cap, max(budget * 2, target))
 
 
 def _topic_fts_values(row: Mapping[Any, Any]) -> dict[str, object]:

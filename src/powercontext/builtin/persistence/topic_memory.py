@@ -63,6 +63,7 @@ from powercontext.builtin.persistence.tags import tag_predicate
 from powercontext.builtin.persistence.topic_memory_index import (
     NoTopicMemoryIndex,
     TopicMemoryIndex,
+    topic_lifecycle_predicate,
     topic_memory_embedding_profile_fingerprint,
 )
 from powercontext.builtin.tags import TagFilter
@@ -379,6 +380,7 @@ class TopicMemoryRepository:
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.family == TopicMemory.family,
+                topic_lifecycle_predicate(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE),
             )
         )
         if tag_filter is not None:

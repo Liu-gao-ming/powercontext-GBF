@@ -60,6 +60,8 @@ from powercontext.builtin.persistence.sqlite.topic_memory_index import (
 from powercontext.builtin.persistence.tables import (
     ARTIFACTS_TABLE,
     BUILTIN_TABLES,
+    SCOPES_TABLE,
+    SOURCE_LIFECYCLE_NODES_TABLE,
     TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
     TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE,
@@ -1106,7 +1108,8 @@ def test_search_rechecks_shape_after_a_concurrent_empty_store_switch(tmp_path: P
     asyncio.run(scenario())
 
 
-def test_sqlite_vector_candidates_filter_profiles_before_the_neighbor_budget() -> None:
+@pytest.mark.parametrize("exclusion", ("profile", "withdrawal"))
+def test_sqlite_vector_candidates_filter_profiles_before_the_neighbor_budget(exclusion: str) -> None:
     async def scenario() -> None:
         embedding_profile = EmbeddingProfile(
             profile_id="current", model="test", dimension=2, distance="l2", normalization="unit"
@@ -1135,11 +1138,34 @@ def test_sqlite_vector_candidates_filter_profiles_before_the_neighbor_budget() -
                             embedding_profile=embedding_profile,
                         ),
                     )
-                for table in (SQLITE_TOPIC_MEMORY_VECTOR_TOPICS_TABLE, SQLITE_TOPIC_MEMORY_VECTOR_CHUNKS_TABLE):
+                if exclusion == "profile":
+                    for table in (SQLITE_TOPIC_MEMORY_VECTOR_TOPICS_TABLE, SQLITE_TOPIC_MEMORY_VECTOR_CHUNKS_TABLE):
+                        await connection.execute(
+                            update(table)
+                            .where(table.c.artifact_id == "wrong")
+                            .values(profile_fingerprint=topic_memory_embedding_profile_fingerprint(wrong_profile))
+                        )
+                else:
                     await connection.execute(
-                        update(table)
-                        .where(table.c.artifact_id == "wrong")
-                        .values(profile_fingerprint=topic_memory_embedding_profile_fingerprint(wrong_profile))
+                        insert(SCOPES_TABLE).values(
+                            scope_id="scope-a",
+                            title="Vector lifecycle",
+                            summary="Filtered topic candidates",
+                            scope_id_search="scope a",
+                            title_search="vector lifecycle",
+                            summary_search="filtered",
+                            version=1,
+                        )
+                    )
+                    await connection.execute(
+                        insert(SOURCE_LIFECYCLE_NODES_TABLE).values(
+                            scope_id="scope-a",
+                            node_key="withdrawn",
+                            payload=b"{}",
+                            available=False,
+                            topic_artifact_id="wrong",
+                            topic_revision=1,
+                        )
                     )
 
             async with profile.database.transaction() as connection:
@@ -1172,7 +1198,14 @@ def test_sqlite_vector_candidates_filter_profiles_before_the_neighbor_budget() -
                     )
                     assert [hit.artifact_ref.artifact_id for hit in result.hits] == ["valid"]
                     assert (await repository.get_exact(connection, "scope-a", result.hits[0].artifact_ref)).is_current
-                    assert len(await repository.browse_current(connection, "scope-a", limit=2)) == 2
+                    assert len(await repository.browse_current(connection, "scope-a", limit=2)) == (
+                        2 if exclusion == "profile" else 1
+                    )
+                    # Withdrawal changes eligibility, never the exact historical body.
+                    withdrawn = await repository.get_exact(
+                        connection, "scope-a", ArtifactRef(family="topic-memory", artifact_id="wrong", revision=1)
+                    )
+                    assert withdrawn.topic.content.title == "wrong recovery"
                     # Direct use of an old adapter also fails closed even if
                     # callers bypass the repository's persistent shape check.
                     stale = SQLiteTopicMemoryVectorIndex(embedding_profile.model_copy(update={"profile_id": "stale"}))

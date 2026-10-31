@@ -33,7 +33,39 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemorySearchRequest,
     TopicMemoryStorageInvariantError,
 )
-from powercontext.builtin.persistence.tables import TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE, TOPIC_MEMORY_ACTIVE_TOPICS_TABLE
+from powercontext.builtin.persistence.tables import (
+    SOURCE_LIFECYCLE_NODES_TABLE,
+    TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
+    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
+)
+
+
+def topic_lifecycle_predicate(topics: Table) -> ColumnElement[bool]:
+    """Filter withdrawn registered bodies before ranking and candidate limits."""
+    nodes = SOURCE_LIFECYCLE_NODES_TABLE
+    return (
+        ~select(nodes.c.node_key)
+        .where(
+            nodes.c.scope_id == topics.c.scope_id,
+            nodes.c.topic_artifact_id == topics.c.artifact_id,
+            nodes.c.topic_revision == topics.c.revision,
+            nodes.c.available.is_(False),
+        )
+        .correlate(topics)
+        .exists()
+    )
+
+
+def topic_lifecycle_sql(alias: str) -> str:
+    """Equivalent predicate for native FTS/ANN SQL, using internal aliases only."""
+    if not alias.replace("_", "").isalnum():
+        raise ValueError("invalid internal Topic SQL alias")  # noqa: TRY003
+    return (
+        "NOT EXISTS (SELECT 1 FROM pc_source_lifecycle_nodes AS lifecycle "  # noqa: S608
+        f"WHERE lifecycle.scope_id = {alias}.scope_id "
+        f"AND lifecycle.topic_artifact_id = {alias}.artifact_id "
+        f"AND lifecycle.topic_revision = {alias}.revision AND lifecycle.available = 0)"
+    )
 
 
 class TopicMemoryIndex(Protocol):
