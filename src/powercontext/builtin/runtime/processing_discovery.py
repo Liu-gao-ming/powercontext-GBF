@@ -74,3 +74,28 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+
+async def source_count_scopes(
+    connection: AsyncConnection,
+    scope_ids: tuple[str, ...],
+    *,
+    binding_name: str,
+    threshold: int,
+) -> frozenset[str]:
+    """Count durable identities after each Family's own successful cursor.
+
+    Journal positions are allocated atomically with insertion, so subtracting
+    the committed cursor from the head counts all new identities, including
+    lineage-only evidence, without reading bodies or counting receipt upgrades.
+    """
+    if not scope_ids:
+        return frozenset()
+    cursors = await SourceCursorRepository().load_many(connection, scope_ids, binding_name)
+    heads = SOURCE_JOURNAL_HEADS_TABLE
+    rows = await connection.execute(select(heads.c.scope_id, heads.c.position).where(heads.c.scope_id.in_(scope_ids)))
+    return frozenset(
+        scope
+        for scope, position in rows
+        if position - (cursors[scope].cursor.sequence if scope in cursors else 0) >= threshold
+    )
